@@ -193,15 +193,19 @@ handle_ref() {
 			fi
 		;;
 		pkg:apk/wolfi*)
-			if [ "$sbom" = "$WORK_DIR/$ref.sbom.spdx.json" ]; then
+			local dest="$WORK_DIR/$ref.sbom.spdx.json"
+			if [ "$sbom" = "$dest" ]; then
 				# Recursive reference, so escape!
+				return
+			elif [ -f "$dest" ]; then
+				info "SBOM already exists [$dest]"
 				return
 			else
 				# Get the apk, extract the SBOM, and then fetch sources in SBOM
 				info "Fetching APK in order to extract SBOM [$ref]"
-				package_to_sbom "$ref" "$WORK_DIR/$ref.sbom.spdx.json"
+				package_to_sbom "$ref" "$dest"
 				info "Fetched SBOM [$sbom]"
-				handle_sbom "$WORK_DIR/$ref.sbom.spdx.json"
+				handle_sbom "$dest"
 			fi
 		;;
 		pkg:oci/image*)
