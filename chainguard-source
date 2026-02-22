@@ -12,6 +12,7 @@ Options:
  -p|--package PACKAGE		target wolfi package to fetch sources
  -s|--sbom SBOM.spdx.json	target sbom to process, fetching all referenced sources
  -a|--arch [amd64|arm64]	Default = amd64
+ -o|--org ORG			Chainguard org (e.g. example.com) for enterprise APK access
  -P|--privileged		Get sources from private repositories (requires git access)
  -d|--dry-run			Dry run (skip actual source downloads)
  -y|--yes			Automatically answer "y" to acknowledge the
@@ -43,6 +44,11 @@ Notes:
 
   This may consume a lot of network bandwidth and disk, and you may be
   throttled by upstream source repository servers.
+
+  For enterprise (private) Chainguard APKs (pkg:apk/chainguard/*), use --org
+  to specify your Chainguard organization (e.g. --org example.com). Requires
+  chainctl to be installed and authenticated. When using --image with a
+  cgr.dev/ORG/image URL the org is auto-detected from the image name.
 "
 }
 
@@ -57,7 +63,7 @@ info() {
 
 # Check dependencies
 checkdeps() {
-	for i in bunzip2 cosign jq git gzip sha512sum ssh tar wget xz; do
+	for i in bunzip2 cosign curl jq git gzip sha512sum ssh tar wget xz; do
 		type $i 2>&1 >/dev/null || error "Please install [$i]."
 	done
 }
@@ -208,6 +214,31 @@ handle_ref() {
 				handle_sbom "$dest"
 			fi
 		;;
+		pkg:apk/chainguard*)
+			if [ -z "$CHAINGUARD_ORG" ]; then
+				info "WARNING: Skipping enterprise APK [$ref] (no --org specified)"
+				return
+			fi
+			local dest="$WORK_DIR/$ref.sbom.spdx.json"
+			if [ "$sbom" = "$dest" ]; then
+				# Recursive reference, so escape!
+				return
+			elif [ -f "$dest" ]; then
+				info "SBOM already exists [$dest]"
+				return
+			else
+				# Get the apk, extract the SBOM, and then fetch sources in SBOM
+				info "Fetching enterprise APK in order to extract SBOM [$ref]"
+				setup_chainguard_auth
+				if [ "$CHAINGUARD_AUTH_DONE" != "1" ]; then
+					info "WARNING: Skipping enterprise APK [$ref] (auth not available)"
+					return
+				fi
+				package_to_sbom "$ref" "$dest"
+				info "Fetched SBOM [$sbom]"
+				handle_sbom "$dest"
+			fi
+		;;
 		pkg:oci/image*)
 			if [ "$PRIVILEGED" = "0" ]; then
 				info "Skipping OCI Image download [$url]"
@@ -290,6 +321,16 @@ package_to_sbom() {
 			fi
 			url="https://packages.wolfi.dev/os/$pkg_arch/$pkg_name-$pkg_version.apk"
 		;;
+		pkg:apk/chainguard/*)
+			# Enterprise purl - build authenticated download URL
+			pkg_name=$(echo "$package" | sed -e "s:^.*/::" -e "s:@.*$::")
+			pkg_version=$(echo "$package" | sed -e "s:^.*@::" -e "s:?.*$::")
+			if echo "$package" | grep -q "arch="; then
+				# override pkg_arch since we have one in the purl
+				pkg_arch=$(echo "$package" | grep -o "arch=[a-z0-9_]\+" | sed "s:.*=::")
+			fi
+			url="https://apk.cgr.dev/${CHAINGUARD_ORG}/${pkg_arch}/${pkg_name}-${pkg_version}.apk"
+		;;
 		*)
 			# Maybe just a common package name -- try to figure it out
 			# Fetch an updated package index, if necessary
@@ -312,10 +353,45 @@ package_to_sbom() {
 	esac
 	local apk_file="$WORK_DIR/artifacts/"$(basename "$url")
 	info "Fetching [$url]"
-	wget --continue -O "$apk_file" "$url"
+	case "$package" in
+		pkg:apk/chainguard/*)
+			# Use curl with HTTP Basic Auth for enterprise APKs
+			curl -fsSL -u "${IDENTITY}:${IDENTITY_TOKEN}" -o "$apk_file" "$url"
+		;;
+		*)
+			# Use wget for public APKs (no auth required)
+			wget --continue -O "$apk_file" "$url"
+		;;
+	esac
 	info "Extracting SBOM from [$apk_file] to [$sbom]"
 	mkdir -p $(dirname "$sbom")
 	tar zxOf "$apk_file" --wildcards "var/lib/db/sbom/*.spdx.json" 2>/dev/null > "$sbom"
+}
+
+# Set up Chainguard authentication for enterprise APK access.
+# This is lazy (called on first enterprise APK) and idempotent (runs only once).
+setup_chainguard_auth() {
+	if [ "$CHAINGUARD_AUTH_DONE" = "1" ]; then
+		return
+	fi
+	if [ -z "$CHAINGUARD_ORG" ]; then
+		info "WARNING: Enterprise APK encountered but no --org specified; skipping."
+		return
+	fi
+	type chainctl 2>&1 >/dev/null || error "Please install [chainctl] to access enterprise APKs."
+	info "Setting up Chainguard auth for org [$CHAINGUARD_ORG]"
+	local token_file
+	token_file=$(mktemp /tmp/chainguard-token.XXXXXX.json)
+	chainctl auth pull-token --parent="${CHAINGUARD_ORG}" -o json 2>/dev/null > "$token_file"
+	IDENTITY=$(jq -r .identity_id "$token_file")
+	IDENTITY_TOKEN=$(jq -r .token "$token_file")
+	rm -f "$token_file"
+	printf 'y\n' | chainctl iam role-bindings create \
+		--parent="${CHAINGUARD_ORG}" \
+		--identity="${IDENTITY}" \
+		--role=apk.pull
+	CHAINGUARD_AUTH_DONE=1
+	info "Chainguard auth configured for org [$CHAINGUARD_ORG]"
 }
 
 # Check dependencies and set default values
@@ -327,6 +403,10 @@ PRIVILEGED=0
 SOURCES_DIR="$(pwd)/sources"
 mkdir -p "$SOURCES_DIR"
 WORK_DIR=
+CHAINGUARD_ORG=
+CHAINGUARD_AUTH_DONE=0
+IDENTITY=
+IDENTITY_TOKEN=
 
 # Handle command line options
 while [ ! -z "$1" ]; do
@@ -359,6 +439,10 @@ while [ ! -z "$1" ]; do
 		-y|--yes)
 			YES=1
 			shift
+		;;
+		-o|--org)
+			CHAINGUARD_ORG="$2"
+			shift 2
 		;;
 		-P|--privileged)
 			PRIVILEGED=1
@@ -393,6 +477,15 @@ fi
 
 # Handle target image
 if [ ! -z "$IMAGE" ]; then
+	# Auto-detect Chainguard org from cgr.dev/ORG/image:tag URLs if --org not specified.
+	# 'chainguard' is the public free-tier org and does not need enterprise auth.
+	if [ -z "$CHAINGUARD_ORG" ] && echo "$IMAGE" | grep -q "^cgr\.dev/"; then
+		extracted_org=$(echo "$IMAGE" | sed -e "s|^cgr\.dev/||" -e "s|/.*$||")
+		if [ "$extracted_org" != "chainguard" ]; then
+			CHAINGUARD_ORG="$extracted_org"
+			info "Auto-detected Chainguard org [$CHAINGUARD_ORG] from image [$IMAGE]"
+		fi
+	fi
 	# Try to determine and retrieve sbom over network
 	# Make a directory to work in
 	WORK_DIR="$SOURCES_DIR/$IMAGE"
