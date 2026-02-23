@@ -198,7 +198,7 @@ handle_ref() {
 				git_checkout "$url"
 			fi
 		;;
-		pkg:apk/wolfi*)
+		pkg:apk/*)
 			local dest="$WORK_DIR/$ref.sbom.spdx.json"
 			if [ "$sbom" = "$dest" ]; then
 				# Recursive reference, so escape!
@@ -209,31 +209,6 @@ handle_ref() {
 			else
 				# Get the apk, extract the SBOM, and then fetch sources in SBOM
 				info "Fetching APK in order to extract SBOM [$ref]"
-				package_to_sbom "$ref" "$dest"
-				info "Fetched SBOM [$sbom]"
-				handle_sbom "$dest"
-			fi
-		;;
-		pkg:apk/chainguard*)
-			if [ -z "$CHAINGUARD_ORG" ]; then
-				info "WARNING: Skipping enterprise APK [$ref] (no --org specified)"
-				return
-			fi
-			local dest="$WORK_DIR/$ref.sbom.spdx.json"
-			if [ "$sbom" = "$dest" ]; then
-				# Recursive reference, so escape!
-				return
-			elif [ -f "$dest" ]; then
-				info "SBOM already exists [$dest]"
-				return
-			else
-				# Get the apk, extract the SBOM, and then fetch sources in SBOM
-				info "Fetching enterprise APK in order to extract SBOM [$ref]"
-				setup_chainguard_auth
-				if [ "$CHAINGUARD_AUTH_DONE" != "1" ]; then
-					info "WARNING: Skipping enterprise APK [$ref] (auth not available)"
-					return
-				fi
 				package_to_sbom "$ref" "$dest"
 				info "Fetched SBOM [$sbom]"
 				handle_sbom "$dest"
@@ -311,25 +286,23 @@ package_to_sbom() {
 			# Fully formed URL, great!
 			url="$package"
 		;;
-		pkg:apk/wolfi/*)
-			# Looks like a purl, reformat to a usable URL
+		pkg:apk/*/*)
+			# APK purl - extract name/version/arch and download via repo list
 			pkg_name=$(echo "$package" | sed -e "s:^.*/::" -e "s:@.*$::")
 			pkg_version=$(echo "$package" | sed -e "s:^.*@::" -e "s:?.*$::")
 			if echo "$package" | grep -q "arch="; then
 				# override pkg_arch since we have one in the purl
 				pkg_arch=$(echo "$package" | grep -o "arch=[a-z0-9_]\+" | sed "s:.*=::")
 			fi
-			url="https://packages.wolfi.dev/os/$pkg_arch/$pkg_name-$pkg_version.apk"
-		;;
-		pkg:apk/chainguard/*)
-			# Enterprise purl - build authenticated download URL
-			pkg_name=$(echo "$package" | sed -e "s:^.*/::" -e "s:@.*$::")
-			pkg_version=$(echo "$package" | sed -e "s:^.*@::" -e "s:?.*$::")
-			if echo "$package" | grep -q "arch="; then
-				# override pkg_arch since we have one in the purl
-				pkg_arch=$(echo "$package" | grep -o "arch=[a-z0-9_]\+" | sed "s:.*=::")
+			local apk_file="$WORK_DIR/artifacts/${pkg_name}-${pkg_version}.apk"
+			if ! download_apk "$pkg_name" "$pkg_version" "$pkg_arch" "$apk_file"; then
+				info "WARNING! Cannot download APK for [$package]"
+				return
 			fi
-			url="https://apk.cgr.dev/${CHAINGUARD_ORG}/${pkg_arch}/${pkg_name}-${pkg_version}.apk"
+			info "Extracting SBOM from [$apk_file] to [$sbom]"
+			mkdir -p $(dirname "$sbom")
+			tar zxOf "$apk_file" --wildcards "var/lib/db/sbom/*.spdx.json" 2>/dev/null > "$sbom"
+			return
 		;;
 		*)
 			# Maybe just a common package name -- try to figure it out
@@ -353,19 +326,44 @@ package_to_sbom() {
 	esac
 	local apk_file="$WORK_DIR/artifacts/"$(basename "$url")
 	info "Fetching [$url]"
-	case "$package" in
-		pkg:apk/chainguard/*)
-			# Use curl with HTTP Basic Auth for enterprise APKs
-			curl -fsSL -u "${IDENTITY}:${IDENTITY_TOKEN}" -o "$apk_file" "$url"
-		;;
-		*)
-			# Use wget for public APKs (no auth required)
-			wget --continue -O "$apk_file" "$url"
-		;;
-	esac
+	wget --continue -O "$apk_file" "$url"
 	info "Extracting SBOM from [$apk_file] to [$sbom]"
 	mkdir -p $(dirname "$sbom")
 	tar zxOf "$apk_file" --wildcards "var/lib/db/sbom/*.spdx.json" 2>/dev/null > "$sbom"
+}
+
+# Download an APK by trying each repo from the image, then falling back to
+# the authenticated enterprise repo. Returns 0 on success, 1 on failure.
+download_apk() {
+	local pkg_name="$1"
+	local pkg_version="$2"
+	local pkg_arch="$3"
+	local apk_file="$4"
+	local repos="${APK_REPOS:-https://packages.wolfi.dev/os}"
+	local found=0
+
+	while IFS= read -r repo; do
+		[ -z "$repo" ] && continue
+		local url="${repo%/}/${pkg_arch}/${pkg_name}-${pkg_version}.apk"
+		info "Trying [$url]"
+		if curl -fsSL "$url" -o "$apk_file" 2>/dev/null; then
+			found=1
+			break
+		fi
+	done <<< "$repos"
+
+	if [ "$found" -eq 0 ] && [ -n "$CHAINGUARD_ORG" ]; then
+		setup_chainguard_auth
+		if [ "$CHAINGUARD_AUTH_DONE" = "1" ]; then
+			local url="https://apk.cgr.dev/${CHAINGUARD_ORG}/${pkg_arch}/${pkg_name}-${pkg_version}.apk"
+			info "Trying enterprise repo [$url]"
+			if curl -fsSL -u "${IDENTITY}:${IDENTITY_TOKEN}" -o "$apk_file" "$url" 2>/dev/null; then
+				found=1
+			fi
+		fi
+	fi
+
+	[ "$found" -eq 1 ]
 }
 
 # Set up Chainguard authentication for enterprise APK access.
@@ -407,6 +405,7 @@ CHAINGUARD_ORG=
 CHAINGUARD_AUTH_DONE=0
 IDENTITY=
 IDENTITY_TOKEN=
+APK_REPOS=
 
 # Handle command line options
 while [ ! -z "$1" ]; do
@@ -486,6 +485,14 @@ if [ ! -z "$IMAGE" ]; then
 			info "Auto-detected Chainguard org [$CHAINGUARD_ORG] from image [$IMAGE]"
 		fi
 	fi
+	# Extract the APK repository list from the image so download_apk knows where to look
+	type crane 2>&1 >/dev/null || error "Please install [crane] to fetch APK repositories from the image."
+	APK_REPOS=$(
+		crane export "$IMAGE" - \
+		| tar -Oxf - etc/apk/repositories \
+		| sed -e 's/[[:space:]]*$//' -e '/^$/d' -e '/^[[:space:]]*#/d'
+	)
+	info "Detected APK repositories: $(echo "$APK_REPOS" | tr '\n' ' ')"
 	# Try to determine and retrieve sbom over network
 	# Make a directory to work in
 	WORK_DIR="$SOURCES_DIR/$IMAGE"
