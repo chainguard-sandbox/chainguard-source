@@ -63,7 +63,7 @@ info() {
 
 # Check dependencies
 checkdeps() {
-	for i in bunzip2 cosign curl jq git gzip sha512sum ssh tar wget xz; do
+	for i in bunzip2 cosign crane curl jq git gzip sha512sum ssh tar wget xz; do
 		type $i 2>&1 >/dev/null || error "Please install [$i]."
 	done
 }
@@ -486,7 +486,6 @@ if [ ! -z "$IMAGE" ]; then
 		fi
 	fi
 	# Extract the APK repository list from the image so download_apk knows where to look
-	type crane 2>&1 >/dev/null || error "Please install [crane] to fetch APK repositories from the image."
 	APK_REPOS=$(
 		crane export "$IMAGE" - \
 		| tar -Oxf - etc/apk/repositories \
