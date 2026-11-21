@@ -74,6 +74,12 @@ info() {
 	echo "INFO: $@" 1>&2
 }
 
+# Retry transient network failures (TLS drops, timeouts, refused
+# connections) instead of failing a long run on one of them
+wget() {
+	command wget --tries=5 --waitretry=3 --retry-connrefused "$@"
+}
+
 # Check dependencies
 checkdeps() {
 	for i in bunzip2 cosign jq git gzip sha256sum sha512sum tar wget xz; do
