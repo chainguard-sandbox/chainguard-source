@@ -13,6 +13,13 @@ Options:
  -p|--package PACKAGE		target wolfi package to fetch sources
  -s|--sbom SBOM.spdx.json	target sbom to process, fetching all referenced sources
  -a|--arch [amd64|arm64]	Default = amd64
+ -S|--source [auto|packages|repos]
+				Where to get each package's source. Default = auto
+				  packages: Chainguard <origin>-source packages only
+				  repos:    upstream repositories and archives named
+				            in the SBOMs (the original behaviour)
+				  auto:     source packages, falling back to upstream
+				            repositories for packages that have none
  -d|--dry-run			Dry run (skip actual source downloads)
  -y|--yes			Automatically answer "y" to acknowledge the
  				warning prompt that this tool will use a lot of
@@ -32,9 +39,17 @@ SBOM.spdx.json:	Path to a Chainguard JSON SPDX file name
 Notes:
   This tool will create a new directory in your present working directory called
   sources/  It will then download the SBOM associated with your specified IMAGE,
-  PACKAGE, or SBOM and then fetch all upstream sources with git and/or wget,
-  at the specific commit used in the image (git), or checked against a checksum
-  (wget).
+  PACKAGE, or SBOM.
+
+  For each package, it first fetches Chainguard's <origin>-source package: the
+  complete corresponding source, with the build recipe, Chainguard's patches
+  and every upstream artifact the build used. Each source package is verified
+  file by file against the manifest (.source.sha256) in the binary package it
+  belongs to, and unpacked under sources/.../packages/.
+
+  For packages without a source package (or with --source repos), it fetches
+  the upstream sources named in the SBOM with git and/or wget, at the specific
+  commit used in the image (git), or checked against a checksum (wget).
 
   This tool is implemented in shell script to provide maximum transparency in
   how it works and for the ease of extensibility by its users.
@@ -61,7 +76,7 @@ info() {
 
 # Check dependencies
 checkdeps() {
-	for i in bunzip2 cosign jq git gzip sha512sum tar wget xz; do
+	for i in bunzip2 cosign jq git gzip sha256sum sha512sum tar wget xz; do
 		type $i 2>&1 >/dev/null || error "Please install [$i]."
 	done
 }
@@ -98,21 +113,65 @@ warn_about_resources() {
 	fi
 }
 
-# Handle our target SBOM
+# Handle our target SBOM, as --source says
 handle_sbom() {
 	local sbom="$1"
+	if [ "$SOURCE_MODE" = "repos" ]; then
+		walk_refs "$sbom"
+	else
+		handle_sbom_source_packages "$sbom"
+	fi
+}
+
+# Fetch every reference locator in an SBOM from upstream (the original
+# behaviour). With a second argument, a file of SPDX IDs, skip the packages
+# it lists.
+walk_refs() {
+	local sbom="$1"
+	local skip="${2:-}"
 	local ref
-	# Find all reference locators in the target SBOM
-	for ref in $(get_refs "$sbom"); do
-		# Handle each reference locator in the target SBOM
+	for ref in $(get_refs "$sbom" "$skip"); do
 		handle_ref "$ref" "$sbom"
 	done
+}
+
+# For each APK in an SBOM, fetch its verified <origin>-source package. A
+# package that has one is covered, with the recipe (DESCRIBED_BY) and the
+# upstream sources (GENERATED_FROM) the SBOM links to it. In auto mode,
+# everything not covered is then fetched from upstream as before.
+handle_sbom_source_packages() {
+	local sbom="$1"
+	local covered="$WORK_DIR/.covered.$(basename "$sbom")"
+	local id purl
+	: > "$covered"
+	while IFS=$'\t' read -r id purl; do
+		[ -n "$purl" ] || continue
+		info "Found package [$purl]"
+		package_to_apk "$purl" || { echo "$purl" >> "$WORK_DIR/.unresolved"; continue; }
+		if fetch_source_package "$LAST_APK"; then
+			echo "$id" >> "$covered"
+			jq -r --arg id "$id" '.relationships[]? | select(.spdxElementId==$id and (.relationshipType=="DESCRIBED_BY" or .relationshipType=="GENERATED_FROM")) | .relatedSpdxElement' "$sbom" >> "$covered"
+		elif [ "$SOURCE_MODE" = "packages" ]; then
+			echo "$(basename "$LAST_APK" .apk)" >> "$WORK_DIR/.unresolved"
+		else
+			echo "$(basename "$LAST_APK" .apk)" >> "$WORK_DIR/.from-repos"
+		fi
+	done < <(jq -r '.packages[] | select(any(.externalRefs[]?; .referenceLocator|startswith("pkg:apk/"))) | [.SPDXID, ([.externalRefs[]?.referenceLocator | select(startswith("pkg:apk/"))][0])] | @tsv' "$sbom")
+	if [ "$SOURCE_MODE" = "auto" ]; then
+		walk_refs "$sbom" "$covered"
+	fi
 }
 
 # Find all reference locator URLs in a target SBOM
 get_refs() {
 	local sbom="$1"
-	jq <"$sbom" -r '.packages[].externalRefs[].referenceLocator'
+	local skip="${2:-}"
+	# Not every package has externalRefs; skip those instead of stopping
+	if [ -n "$skip" ] && [ -s "$skip" ]; then
+		jq <"$sbom" -r --rawfile skip "$skip" '($skip | split("\n")) as $s | .packages[] | select(.SPDXID as $i | $s | index($i) | not) | .externalRefs[]?.referenceLocator'
+	else
+		jq <"$sbom" -r '.packages[].externalRefs[]?.referenceLocator'
+	fi
 }
 
 # Decode URLs
@@ -173,7 +232,7 @@ handle_ref() {
 				info "Fetching APK in order to extract SBOM [$ref]"
 				package_to_sbom "$ref" "$WORK_DIR/$ref.sbom.spdx.json"
 				info "Fetched SBOM [$sbom]"
-				handle_sbom "$WORK_DIR/$ref.sbom.spdx.json"
+				walk_refs "$WORK_DIR/$ref.sbom.spdx.json"
 			fi
 		;;
 		pkg:oci/image*)
@@ -203,10 +262,108 @@ git_checkout() {
 	else
 		# Directory is busted, or doesn't exist, so clone fresh from source
 		info "Need a clean working repo at [$repo]"
-		rm -rf "$WORK_DIR/$ref" && git clone "$repo" "$WORK_DIR/$ref"
+		# A repo we can't read (private, moved, deleted) is reported, not fatal
+		rm -rf "$WORK_DIR/$ref"
+		if ! GIT_TERMINAL_PROMPT=0 git clone "$repo" "$WORK_DIR/$ref"; then
+			info "WARNING: could not clone [$repo]"
+			echo "$repo" >> "$WORK_DIR/.failed-upstreams"
+			return 0
+		fi
 	fi
 	# Rewind back to the exact specified commit in the SBOM
-	git -C "$WORK_DIR/$ref" checkout "$commit"
+	if ! git -C "$WORK_DIR/$ref" checkout "$commit"; then
+		info "WARNING: commit [$commit] not found in [$repo]"
+		echo "$repo@$commit" >> "$WORK_DIR/.failed-upstreams"
+	fi
+}
+
+# Fetch, verify and unpack the <origin>-source package for a binary APK.
+# Returns 0 when the source package was fetched (or already was), 1 when the
+# binary has no source package, and exits on a verification failure.
+fetch_source_package() {
+	local apk_file="$1"
+	local pkginfo origin pkgver arch key src_name src_url src_file dest manifest
+	[ -f "$apk_file" ] || return 1
+	pkginfo=$(tar zxOf "$apk_file" .PKGINFO 2>/dev/null) || return 1
+	pkgver=$(echo "$pkginfo" | sed -n 's/^pkgver = //p')
+	arch=$(echo "$pkginfo" | sed -n 's/^arch = //p')
+	origin=$(echo "$pkginfo" | sed -n 's/^origin = //p')
+	[ -n "$origin" ] || origin=$(echo "$pkginfo" | sed -n 's/^pkgname = //p')
+	key="$origin-$pkgver"
+	dest="$WORK_DIR/packages/$key"
+	# Subpackages of one build share a source package; fetch it once
+	if [ -f "$dest/.verified" ]; then
+		info "Already have verified source package for [$key]"
+		return 0
+	fi
+	manifest=$(tar zxOf "$apk_file" .source.sha256 2>/dev/null)
+	if [ -z "$manifest" ]; then
+		info "No source manifest in [$(basename "$apk_file")]; built before source packages"
+		echo "$key" >> "$WORK_DIR/.no-source-package"
+		return 1
+	fi
+	src_name="$origin-source-$pkgver.apk"
+	src_url="$APK_BASE/src/$arch/$src_name"
+	src_file="$WORK_DIR/artifacts/$src_name"
+	info "Fetching source package [$src_url]"
+	[ "$DRYRUN" = "1" ] && return 0
+	if ! wget -q --continue -O "$src_file" "$src_url"; then
+		rm -f "$src_file"
+		info "No source package published at [$src_url]"
+		echo "$key" >> "$WORK_DIR/.no-source-package"
+		return 1
+	fi
+	# Refuse absolute paths and .. before unpacking
+	if tar tzf "$src_file" 2>/dev/null | grep -q -E '(^/|(^|/)\.\.(/|$))'; then
+		error "Unsafe path in source package [$src_file]"
+	fi
+	rm -rf "$dest" && mkdir -p "$dest"
+	tar xzf "$src_file" -C "$dest" 2>/dev/null
+	[ -d "$dest/usr/src/$origin" ] || error "Source package [$src_file] has no usr/src/$origin"
+	echo "$manifest" > "$dest/binary.source.sha256"
+	info "Verifying [$src_name] against the manifest in [$(basename "$apk_file")]"
+	if ! (cd "$dest/usr/src/$origin" && sha256sum --quiet -c "$dest/binary.source.sha256"); then
+		# Drop the bad download so a re-run fetches it again
+		rm -f "$src_file"
+		error "Source package [$src_file] does not match the manifest in [$apk_file]"
+	fi
+	touch "$dest/.verified"
+	echo "$key" >> "$WORK_DIR/.from-source-package"
+	info "Verified source for [$key] in [$dest/usr/src/$origin]"
+	return 0
+}
+
+# Print what came from where, and set the exit status
+summarize() {
+	[ -n "$WORK_DIR" ] || return 0
+	local n_pkg n_repo n_unres
+	n_pkg=$(sort -u "$WORK_DIR/.from-source-package" 2>/dev/null | wc -l)
+	n_repo=$(sort -u "$WORK_DIR/.from-repos" 2>/dev/null | wc -l)
+	n_unres=$(sort -u "$WORK_DIR/.unresolved" 2>/dev/null | wc -l)
+	echo
+	info "Summary (--source $SOURCE_MODE):"
+	info "  $n_pkg origin(s) from verified source packages in [$WORK_DIR/packages]"
+	if [ "$n_repo" -gt 0 ]; then
+		info "  $n_repo package(s) fell back to upstream repositories:"
+		sort -u "$WORK_DIR/.from-repos" | sed 's/^/INFO:     /' 1>&2
+	fi
+	if [ -s "$WORK_DIR/.failed-upstreams" ]; then
+		info "  $(sort -u "$WORK_DIR/.failed-upstreams" | wc -l) upstream source(s) could not be fetched:"
+		sort -u "$WORK_DIR/.failed-upstreams" | sed 's/^/INFO:     /' 1>&2
+	fi
+	if [ "$n_unres" -gt 0 ]; then
+		info "  $n_unres package(s) have no source package:"
+		sort -u "$WORK_DIR/.unresolved" | sed 's/^/INFO:     /' 1>&2
+		return 1
+	fi
+	return 0
+}
+
+# Fetch the binary APK for a purl or name (sets LAST_APK)
+package_to_apk() {
+	local package="$1"
+	local tmp="$WORK_DIR/sboms/.$(echo "$package" | tr -c 'A-Za-z0-9._-' '_').spdx.json"
+	package_to_sbom "$package" "$tmp" && [ -f "$LAST_APK" ]
 }
 
 package_to_sbom() {
@@ -232,29 +389,32 @@ package_to_sbom() {
 			# Looks like a purl, reformat to a usable URL
 			pkg_name=$(echo "$package" | sed -e "s:^.*/::" -e "s:@.*$::")
 			pkg_version=$(echo "$package" | sed -e "s:^.*@::" -e "s:?.*$::")
-			pkg_arch=$(echo "$package" | sed -e "s:^.*=::")
-			url="https://packages.wolfi.dev/os/$pkg_arch/$pkg_name-$pkg_version.apk"
+			# Read the arch qualifier by name; purls carry others (distro, origin)
+			pkg_arch=$(echo "$package" | sed -n -e 's:.*[?&]arch=\([^&]*\).*:\1:p')
+			[ -n "$pkg_arch" ] || pkg_arch=$(echo "$ARCH" | sed -e 's/arm64/aarch64/' -e 's/amd64/x86_64/')
+			url="$APK_BASE/$pkg_arch/$pkg_name-$pkg_version.apk"
 		;;
 		*)
 			# Maybe just a common package name -- try to figure it out
 			# Fetch an updated package index, if necessary
 			info "Fetching package index"
-			wget --continue -O "$WORK_DIR/artifacts/APKINDEX.tar.gz" "https://packages.wolfi.dev/os/$pkg_arch/APKINDEX.tar.gz"
+			wget --continue -O "$WORK_DIR/artifacts/APKINDEX.tar.gz" "$APK_BASE/$pkg_arch/APKINDEX.tar.gz"
 			tar xf "$WORK_DIR/artifacts/APKINDEX.tar.gz" -C "$WORK_DIR/artifacts/" 2>/dev/null
 			if grep -q -m1 "^P:$package$" "$WORK_DIR/artifacts/APKINDEX" 2>/dev/null; then
 				# Found a precise match for our package name; great; version unspecified, so get the latest version
 				pkg_name="$package"
 				pkg_version=$(grep -A1 "^P:$pkg_name$" "$WORK_DIR/artifacts/APKINDEX" | grep "^V:" | sed -e "s/^V://" | sort -V | tail -n1)
-				url="https://packages.wolfi.dev/os/$pkg_arch/$pkg_name-$pkg_version.apk"
+				url="$APK_BASE/$pkg_arch/$pkg_name-$pkg_version.apk"
 			elif echo "$package" | grep -q '\-r[0-9]\+$'; then
 				# Package name ends in an epoch, so let's assume this one includes a precise version
-				url="https://packages.wolfi.dev/os/$pkg_arch/$package.apk"
+				url="$APK_BASE/$pkg_arch/$package.apk"
 			else
 				error "Cannot determine URL for APK to extract SBOM"
 			fi
 		;;
 	esac
 	local apk_file="$WORK_DIR/artifacts/"$(basename "$url")
+	LAST_APK="$apk_file"
 	info "Fetching [$url]"
 	wget --continue -O "$apk_file" "$url"
 	info "Extracting SBOM from [$apk_file] to [$sbom]"
@@ -266,6 +426,9 @@ package_to_sbom() {
 checkdeps
 DRYRUN=0
 YES=0
+SOURCE_MODE="auto"
+APK_BASE="${CHAINGUARD_APK_BASE:-https://apk.cgr.dev/chainguard}"
+LAST_APK=
 ARCH="amd64"
 SOURCES_DIR="$(pwd)/sources"
 mkdir -p "$SOURCES_DIR"
@@ -293,6 +456,14 @@ while [ ! -z "$1" ]; do
 		;;
 		-p|--package)
 			PACKAGE="$2"
+			shift 2
+		;;
+		-S|--source)
+			SOURCE_MODE="$2"
+			case "$SOURCE_MODE" in
+				auto|packages|repos) ;;
+				*) error "--source must be auto, packages or repos" ;;
+			esac
 			shift 2
 		;;
 		-s|--sbom)
@@ -339,6 +510,8 @@ if [ ! -z "$IMAGE" ]; then
 	WORK_DIR="$SOURCES_DIR/$image_url-$ARCH"
 	mkdir -p "$WORK_DIR"/sboms "$WORK_DIR"/artifacts
 	sbom="$WORK_DIR/sboms/$image_url-$ARCH.sbom.spdx.json"
+	# The image URL has slashes, so the SBOM's directory needs creating too
+	mkdir -p "$(dirname "$sbom")"
 	info "Fetching sbom [$ARCH/$image_url]"
 	cosign download attestation \
 	  --platform linux/$ARCH \
@@ -361,3 +534,5 @@ if [ ! -z "$PACKAGE" ]; then
 	info "Fetched sbom [$sbom]"
 	handle_sbom "$sbom"
 fi
+
+summarize
