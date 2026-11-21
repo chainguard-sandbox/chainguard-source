@@ -239,10 +239,16 @@ handle_ref() {
 			git_checkout "$url"
 		;;
 		pkg:apk/wolfi*)
-			if [ "$sbom" = "$WORK_DIR/$ref.sbom.spdx.json" ]; then
-				# Recursive reference, so escape!
+			# Walk each APK once. SBOMs name an APK under several purls
+			# (distro=, origin= qualifiers) that point at each other, so
+			# key on name@version rather than the purl.
+			local walked_key
+			walked_key=$(echo "$url" | sed -e 's:^pkg\:apk/[^/]*/::' -e 's:?.*$::')
+			if [ "$sbom" = "$WORK_DIR/$ref.sbom.spdx.json" ] || grep -qxF "$walked_key" "$WORK_DIR/.walked" 2>/dev/null; then
+				# Already walked (or a self reference), so escape!
 				return
 			else
+				echo "$walked_key" >> "$WORK_DIR/.walked"
 				# Get the apk, extract the SBOM, and then fetch sources in SBOM
 				info "Fetching APK in order to extract SBOM [$ref]"
 				package_to_sbom "$ref" "$WORK_DIR/$ref.sbom.spdx.json"
