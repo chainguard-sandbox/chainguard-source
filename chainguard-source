@@ -77,7 +77,16 @@ info() {
 # Retry transient network failures (TLS drops, timeouts, refused
 # connections) instead of failing a long run on one of them
 wget() {
-	command wget --tries=5 --waitretry=3 --retry-connrefused "$@"
+	local i rc
+	for i in 1 2 3 4 5; do
+		command wget --tries=3 --waitretry=3 --retry-connrefused "$@" && return 0
+		rc=$?
+		# 4 is a network failure, including DNS, which --tries does not retry
+		[ "$rc" = 4 ] || return "$rc"
+		info "Network failure, retrying in $((i * 5))s"
+		sleep $((i * 5))
+	done
+	return "$rc"
 }
 
 # Check dependencies
@@ -421,8 +430,13 @@ package_to_sbom() {
 	esac
 	local apk_file="$WORK_DIR/artifacts/"$(basename "$url")
 	LAST_APK="$apk_file"
-	info "Fetching [$url]"
-	wget --continue -O "$apk_file" "$url"
+	# The fallback walk meets the same APK again; reuse a complete download
+	if [ -s "$apk_file" ] && tar zxOf "$apk_file" .PKGINFO >/dev/null 2>&1; then
+		info "Already have [$apk_file]"
+	else
+		info "Fetching [$url]"
+		wget --continue -O "$apk_file" "$url"
+	fi
 	info "Extracting SBOM from [$apk_file] to [$sbom]"
 	mkdir -p $(dirname "$sbom")
 	tar zxOf "$apk_file" --wildcards "var/lib/db/sbom/*.spdx.json" 2>/dev/null > "$sbom"
